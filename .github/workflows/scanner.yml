@@ -9,7 +9,7 @@ name: crypto-scanner
 
 on:
   schedule:
-    - cron: "*/15 * * * *"     # her 15 dakikada bir (UTC).
+    - cron: "7,22,37,52 * * * *"     # her 15 dakikada bir (UTC).
     # NOT: 15 dk -> ayda ~2880 calisma. PRIVATE repoda ucretsiz 2000 dk/ay
     # sinirini asabilir. Sinirsiz icin repo'yu PUBLIC yap (ve main.py'deki
     # gomulu token'i silip yalnizca Secret kullan). Saatte bir icin: "0 * * * *".
