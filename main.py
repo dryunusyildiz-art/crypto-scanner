@@ -143,6 +143,19 @@ class Config:
     MIN_VOLUME_RATIO_STRONG: float = float(_env("MIN_VOLUME_RATIO_STRONG", "2.0"))
     MIN_VOLUME_RATIO_WATCH: float = float(_env("MIN_VOLUME_RATIO_WATCH", "1.5"))
 
+    # --- TEST MODU ---
+    # true iken skor/hacim esikleri gecici olarak dusurulur -> gercek piyasa
+    # verisiyle (gercek grafik + gercek caption) en az bir Telegram mesaji
+    # garanti gonderilir, boylece format canli olarak dogrulanabilir. Sadece
+    # workflow_dispatch'te elle isaretlendiginde aktif olur; zamanlanan
+    # (cron) taramalarda HER ZAMAN false -> uretim esikleri etkilenmez.
+    TEST_FORCE_LOW_THRESHOLD: bool = _env("TEST_FORCE_LOW_THRESHOLD", "false").lower() == "true"
+    if TEST_FORCE_LOW_THRESHOLD:
+        MIN_OPPORTUNITY_SCORE_STRONG = 1.0
+        MIN_OPPORTUNITY_SCORE_WATCH = 1.0
+        MIN_VOLUME_RATIO_STRONG = 0.0
+        MIN_VOLUME_RATIO_WATCH = 0.0
+
     # --- Spread esikleri (yuzde) ---
     SPREAD_EXCELLENT: float = 0.03
     SPREAD_OK: float = 0.07
@@ -1334,6 +1347,9 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
     log.info("Tarama basladi | %s | %d coin | tf=%s | paralellik=%d",
              datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
              len(symbols), ",".join(cfg.TIMEFRAMES), cfg.MAX_CONCURRENCY)
+    if cfg.TEST_FORCE_LOW_THRESHOLD:
+        log.warning("⚠️ TEST MODU AKTIF: esikler gecici dusuruldu, en az bir Telegram "
+                    "mesaji gonderilecek (format testi icin -- uretimde kullanma!)")
     log.info("=" * 78)
 
     sem = asyncio.Semaphore(cfg.MAX_CONCURRENCY)
