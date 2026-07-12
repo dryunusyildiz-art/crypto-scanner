@@ -13,7 +13,13 @@ on:
     # NOT: 15 dk -> ayda ~2880 calisma. PRIVATE repoda ucretsiz 2000 dk/ay
     # sinirini asabilir. Sinirsiz icin repo'yu PUBLIC yap (ve main.py'deki
     # gomulu token'i silip yalnizca Secret kullan). Saatte bir icin: "0 * * * *".
-  workflow_dispatch: {}         # Actions sekmesinden ELLE calistirma butonu
+  workflow_dispatch:            # Actions sekmesinden ELLE calistirma butonu
+    inputs:
+      test_mode:
+        description: "Test modu: esikleri gecici dusur, Telegram formatini gercek veriyle dogrula"
+        required: false
+        default: false
+        type: boolean
 
 # Ayni anda tek calisma olsun (onceki bitmeden yenisi baslamasin)
 concurrency:
@@ -57,4 +63,9 @@ jobs:
           # Swing trade modu: ayni coin+yon icin 6 saat cooldown, gereksiz
           # tekrar mesaj gelmesin (skor 10+ artarsa yine de guncelleme gelir).
           ALERT_COOLDOWN_MINUTES: "360"
+          # "Run workflow" ile elle calistirirken test_mode kutusunu
+          # isaretlerseniz esikler gecici duser -> gercek veriyle en az bir
+          # Telegram mesaji (grafik+caption) garanti gelir. Zamanlanan (cron)
+          # calismalarda bu girdi hic olmadigi icin daima "false" kalir.
+          TEST_FORCE_LOW_THRESHOLD: "${{ github.event.inputs.test_mode || 'false' }}"
         run: python main.py --once
