@@ -221,10 +221,41 @@ class Config:
     # pos<=CHANNEL_TRADE_POS_LONG -> alt banda "yakin" (LONG adayi)
     # pos>=CHANNEL_TRADE_POS_SHORT -> ust banda "yakin" (SHORT adayi)
     # Aradaki bolge (kanal ortasi) icin hicbir sinyal uretilmez.
-    CHANNEL_TRADE_POS_LONG: float = float(_env("CHANNEL_TRADE_POS_LONG", "0.2"))
-    CHANNEL_TRADE_POS_SHORT: float = float(_env("CHANNEL_TRADE_POS_SHORT", "0.8"))
+    CHANNEL_TRADE_POS_LONG: float = float(_env("CHANNEL_TRADE_POS_LONG", "0.15"))
+    CHANNEL_TRADE_POS_SHORT: float = float(_env("CHANNEL_TRADE_POS_SHORT", "0.85"))
     MIN_CHANNEL_SCORE_STRONG: float = float(_env("MIN_CHANNEL_SCORE_STRONG", "70"))
     MIN_CHANNEL_SCORE_WATCH: float = float(_env("MIN_CHANNEL_SCORE_WATCH", "55"))
+
+    # --- KANAL: ERKEN YAKALAMA -------------------------------------------------
+    # Tek bir sert pos<=0.2 esigi, fiyat banda tam degmeden donerse veya iki
+    # tarama arasinda dip/tepe an'ini kacirirsak sinyali tamamen kaybettiriyordu.
+    # Asagidaki 3 mekanizma AYNI KANAL LONG/SHORT sinyaline ek giris yollari
+    # acar (yeni bir mesaj turu DEGIL, sadece "ne zaman tetiklenir" genisler):
+    #   1) Tam degme        : pos<=POS_LONG (mevcut, en guclu)
+    #   2) Yakin gecmis hafizasi: son CHANNEL_TRADE_RECENT_BARS mumun ICINDE
+    #      pos<=POS_LONG'a degilmis VE simdi toparlaniyorsa (iki tarama
+    #      arasinda tam dip/tepe kacsa bile yakalanir)
+    #   3) Yaklasma + sikisma + hacim: pos henuz esige degmemis ama yaklasim
+    #      bolgesindeyken (POS_LONG, POS_LONG+MARGIN] BB sikismasi + hacim
+    #      artisi varsa erken tetiklenir (score_breakout'taki erken kirilim
+    #      mantiginin kanal versiyonu)
+    # Diverjans (asagida) da ayri bir tetikleyicidir. Puan butcesi (bkz.
+    # score_channel_trade_setup + evaluate_channel_trade) STRONG esigine
+    # (70) SADECE gercek confluence (birden fazla sinyal ayni yonde) ile
+    # ulasilacak sekilde kalibre edildi -- tek basina zayif bir "yaklasiyor"
+    # sinyali STRONG'a asla ulasmaz, boylece kalite dusmez.
+    CHANNEL_TRADE_APPROACH_MARGIN: float = float(_env("CHANNEL_TRADE_APPROACH_MARGIN", "0.15"))
+    CHANNEL_TRADE_RECENT_BARS: int = int(_env("CHANNEL_TRADE_RECENT_BARS", "5"))
+    DIVERGENCE_LOOKBACK: int = int(_env("DIVERGENCE_LOOKBACK", "20"))
+    DIVERGENCE_RSI_MARGIN: float = float(_env("DIVERGENCE_RSI_MARGIN", "3"))
+
+    # --- Telegram gonderim filtresi ---
+    # Kullanicinin talebi: Telegram'a SADECE kanal-banda-dayali kesin LONG/SHORT
+    # (KANAL + STRONG) sinyalleri gitsin. BREAKOUT modu ve KANAL/WATCH hala
+    # hesaplanir + terminal log'da gorulur (referans/karsilastirma icin) ama
+    # varsayilan olarak Telegram'a gonderilmez. Istenirse .env'den acilabilir.
+    TELEGRAM_SEND_BREAKOUT: bool = _env("TELEGRAM_SEND_BREAKOUT", "false").lower() == "true"
+    TELEGRAM_SEND_KANAL_WATCH: bool = _env("TELEGRAM_SEND_KANAL_WATCH", "false").lower() == "true"
 
     # --- Disclaimer ---
     DISCLAIMER: str = ("Bu mesaj yatirim tavsiyesi degildir. "
@@ -424,6 +455,10 @@ class MarketSnapshot:
     channel_lower: float
     channel_pos: float       # 0=alt bant, 1=ust bant, <0/>1 = bandin disinda
     channel_slope_up: bool   # regresyon dogrusunun egimi yukari mi
+    channel_pos_min_recent: float   # son N barin (mevcut bant sabit tutularak) en dusuk pozisyonu
+    channel_pos_max_recent: float   # son N barin en yuksek pozisyonu
+    bullish_divergence: bool        # fiyat dusuk yaparken RSI yukselmis (donus sinyali)
+    bearish_divergence: bool        # fiyat yuksek yaparken RSI dusmus (donus sinyali)
 
 
 @dataclass
@@ -661,7 +696,8 @@ def build_snapshot(cfg: Config, symbol: str, df: pd.DataFrame,
     # --- Momentum ---
     vwap_series = session_vwap(df)
     vwap_now = float(vwap_series.iloc[-1])
-    rsi_now = float(rsi(close, cfg.RSI_PERIOD).iloc[-1])
+    rsi_series = rsi(close, cfg.RSI_PERIOD)
+    rsi_now = float(rsi_series.iloc[-1])
     roc_val = roc(close, cfg.ROC_PERIOD).iloc[-1]
     roc_now = float(roc_val) if not math.isnan(roc_val) else 0.0
     adx_df = adx(df, cfg.ADX_PERIOD)
@@ -703,8 +739,13 @@ def build_snapshot(cfg: Config, symbol: str, df: pd.DataFrame,
         cfg, order_book, ticker, price)
 
     # --- Lineer regresyon kanali icindeki konum (yumusak filtre + kanal modu icin) ---
-    ch_upper, ch_lower, ch_pos, ch_slope_up = regression_channel_position(
-        close, cfg.REGRESSION_CHANNEL_PERIOD, cfg.REGRESSION_CHANNEL_STD, price)
+    ch_upper, ch_lower, ch_pos, ch_slope_up, ch_pos_min_r, ch_pos_max_r = regression_channel_position(
+        close, cfg.REGRESSION_CHANNEL_PERIOD, cfg.REGRESSION_CHANNEL_STD, price,
+        recent_n=cfg.CHANNEL_TRADE_RECENT_BARS)
+
+    # --- RSI/fiyat diverjansi (kanal modu erken donus tetikleyicisi) ---
+    bull_div, bear_div = detect_divergence(
+        close, rsi_series, cfg.DIVERGENCE_LOOKBACK, cfg.DIVERGENCE_RSI_MARGIN)
 
     return MarketSnapshot(
         symbol=symbol, price=price,
@@ -725,20 +766,27 @@ def build_snapshot(cfg: Config, symbol: str, df: pd.DataFrame,
         total_depth=total_depth, imbalance=imbalance,
         channel_upper=ch_upper, channel_lower=ch_lower, channel_pos=ch_pos,
         channel_slope_up=ch_slope_up,
+        channel_pos_min_recent=ch_pos_min_r, channel_pos_max_recent=ch_pos_max_r,
+        bullish_divergence=bull_div, bearish_divergence=bear_div,
     )
 
 
 def regression_channel_position(close: pd.Series, period: int, k: float,
-                                price: float) -> tuple[float, float, float, bool]:
+                                price: float, recent_n: int = 5
+                                ) -> tuple[float, float, float, bool, float, float]:
     """Son `period` kapanisa lineer regresyon + std-sapma kanali kurar ve
     GUNCEL fiyatin bu kanal icindeki konumunu dondurur.
 
-    Donus: (ust_bant, alt_bant, pozisyon, egim_yukari) -- pozisyon: 0=alt
-    bant, <0 bandin altinda, >1 bandin ustunde (asiri uzamis).
+    Ayrica son `recent_n` barin AYNI (sabit) bant icindeki pozisyonlarinin
+    min/max degerlerini de doner -- "son birkac mumda banda degip degmedigi"
+    (iki tarama arasi kacirilan dip/tepe) tespiti icin kullanilir.
+
+    Donus: (ust_bant, alt_bant, pozisyon, egim_yukari, poz_min_son_N, poz_max_son_N)
+    pozisyon: 0=alt bant, 1=ust bant, <0 bandin altinda, >1 bandin ustunde.
     """
     n = min(period, len(close))
     if n < 20:
-        return price, price, 0.5, True
+        return price, price, 0.5, True, 0.5, 0.5
     tail = close.tail(n).to_numpy(dtype=float)
     x = np.arange(n, dtype=float)
     slope, intercept = np.polyfit(x, tail, 1)
@@ -748,7 +796,55 @@ def regression_channel_position(close: pd.Series, period: int, k: float,
     lower = fitted_last - k * resid_std
     band = upper - lower
     pos = (price - lower) / band if band > 0 else 0.5
-    return float(upper), float(lower), float(pos), bool(slope >= 0)
+
+    m = min(recent_n, n)
+    recent_closes = tail[-m:]
+    if band > 0:
+        pos_recent = (recent_closes - lower) / band
+    else:
+        pos_recent = np.full(m, 0.5)
+    pos_min_recent = float(pos_recent.min())
+    pos_max_recent = float(pos_recent.max())
+
+    return (float(upper), float(lower), float(pos), bool(slope >= 0),
+            pos_min_recent, pos_max_recent)
+
+
+def detect_divergence(close: pd.Series, rsi_series: pd.Series, lookback: int = 20,
+                      rsi_margin: float = 3.0) -> tuple[bool, bool]:
+    """Basit fiyat/RSI diverjans tespiti (klasik donus erken-uyari sinyali).
+
+    Son `lookback` bar (mevcut bar haric) icindeki en dusuk/en yuksek kapanisa
+    gore mevcut bar karsilastirilir:
+      - BULLISH: fiyat esit/daha dusuk dip yapiyor AMA RSI o zamanki dipten
+        belirgin (rsi_margin) yuksekte -> satis baskisi zayifliyor, donus erken sinyali.
+      - BEARISH: fiyat esit/daha yuksek tepe yapiyor AMA RSI o zamanki tepeden
+        belirgin dusuk -> alis baskisi zayifliyor.
+    Donus: (bullish_divergence, bearish_divergence).
+    """
+    n = len(close)
+    m = min(lookback, n - 1)
+    if m < 5:
+        return False, False
+    window_close = close.tail(m + 1).to_numpy(dtype=float)
+    window_rsi = rsi_series.tail(m + 1).to_numpy(dtype=float)
+    prior_close = window_close[:-1]
+    prior_rsi = window_rsi[:-1]
+    cur_close = window_close[-1]
+    cur_rsi = window_rsi[-1]
+
+    bullish = False
+    bearish = False
+    if len(prior_close) > 0 and not np.isnan(cur_rsi):
+        lo_idx = int(np.argmin(prior_close))
+        if cur_close <= prior_close[lo_idx] and not np.isnan(prior_rsi[lo_idx]):
+            if cur_rsi > prior_rsi[lo_idx] + rsi_margin:
+                bullish = True
+        hi_idx = int(np.argmax(prior_close))
+        if cur_close >= prior_close[hi_idx] and not np.isnan(prior_rsi[hi_idx]):
+            if cur_rsi < prior_rsi[hi_idx] - rsi_margin:
+                bearish = True
+    return bullish, bearish
 
 
 def compute_microstructure(cfg: Config, order_book: Optional[dict],
@@ -1050,68 +1146,150 @@ def evaluate(cfg: Config, s: MarketSnapshot, timeframe: str) -> Signal:
 # ayni coin icin ikisi de (farkli yonlerde bile) tetiklenebilir.
 
 def score_channel_trade_setup(s: MarketSnapshot, direction: str) -> tuple[float, list[str]]:
-    """Bant ucunda 'donus/destek-direnc tutuyor' teyidi arar (RSI asiriligi,
-    yon bilgili fitil reddi, kanalin genel egimiyle uyum). evaluate()'deki
-    breakout/momentum skorlarindan bagimsizdir."""
+    """Bant ucunda 'donus/destek-direnc tutuyor' teyidi arar: RSI asiriligi,
+    yon bilgili fitil reddi, kanalin genel egimiyle uyum, RSI/fiyat diverjansi.
+    evaluate()'deki breakout/momentum skorlarindan bagimsizdir. Puan tavani
+    45 -- tek bir zayif isaret STRONG'a goturmez, birden fazla isaretin AYNI
+    yonde ust uste binmesi (confluence) gerekir."""
     pts = 0.0
     reasons: list[str] = []
     if direction == "LONG":
         if s.rsi < 35:
-            pts += 10; reasons.append(f"RSI asiri satim ({s.rsi:.0f})")
+            pts += 14; reasons.append(f"RSI asiri satim ({s.rsi:.0f})")
         elif s.rsi < 45:
-            pts += 5; reasons.append(f"RSI zayif ({s.rsi:.0f})")
+            pts += 7; reasons.append(f"RSI zayif ({s.rsi:.0f})")
         if s.last_bullish and s.last_lower_wick_ratio > 0.30:
-            pts += 8; reasons.append("Alt bantta donus fitili (destek tutuyor)")
+            pts += 12; reasons.append("Alt bantta donus fitili")
         if s.channel_slope_up:
-            pts += 7; reasons.append("Kanal egimi yukari (trend yonunde geri cekilme)")
+            pts += 9; reasons.append("Kanal egimi yukari")
+        if s.bullish_divergence:
+            pts += 10; reasons.append("RSI pozitif diverjans")
         if s.adx_rising and s.rsi > 30:
-            pts += 3
+            pts += 4
     elif direction == "SHORT":
         if s.rsi > 65:
-            pts += 10; reasons.append(f"RSI asiri alim ({s.rsi:.0f})")
+            pts += 14; reasons.append(f"RSI asiri alim ({s.rsi:.0f})")
         elif s.rsi > 55:
-            pts += 5; reasons.append(f"RSI guclu ({s.rsi:.0f})")
+            pts += 7; reasons.append(f"RSI guclu ({s.rsi:.0f})")
         if (not s.last_bullish) and s.last_upper_wick_ratio > 0.30:
-            pts += 8; reasons.append("Ust bantta donus fitili (direnc tutuyor)")
+            pts += 12; reasons.append("Ust bantta donus fitili")
         if not s.channel_slope_up:
-            pts += 7; reasons.append("Kanal egimi asagi (trend yonunde geri cekilme)")
+            pts += 9; reasons.append("Kanal egimi asagi")
+        if s.bearish_divergence:
+            pts += 10; reasons.append("RSI negatif diverjans")
         if s.adx_rising and s.rsi < 70:
-            pts += 3
-    return min(pts, 28.0), reasons
+            pts += 4
+    return min(pts, 45.0), reasons
 
 
 def evaluate_channel_trade(cfg: Config, s: MarketSnapshot, timeframe: str) -> Optional[Signal]:
-    """KANAL/SWING sinyali: kanal konumu burada SERT FILTREDIR (gate).
+    """KANAL/SWING sinyali. TEK bir LONG/SHORT sinyal turu -- asagidaki 4 yol
+    hepsi AYNI sinyale farkli giris kapilaridir (ayri bir "erken/ara" mesaj
+    turu YOK, hepsi tek bir KANAL LONG ya da KANAL SHORT sonucuna toplanir):
 
-    - pos <= CHANNEL_TRADE_POS_LONG  -> alt banda yakin -> yalnizca LONG adayi
-    - pos >= CHANNEL_TRADE_POS_SHORT -> ust banda yakin -> yalnizca SHORT adayi
-    - aradaki (kanal ortasi) durumlarda None doner -- hicbir sinyal uretilmez.
+      1) Tam degme    : pos <= POS_LONG (ya da >= POS_SHORT) -- en guclu, en
+         yuksek yakinlik puani.
+      2) Yakin gecmis  : su an pos esigin biraz disinda olsa bile, son
+         CHANNEL_TRADE_RECENT_BARS mum icinde banda deyip simdi (bu mumda)
+         toparlaniyorsa (last_bullish/last_bearish) yine tetiklenir -- iki
+         tarama arasi kacan tam dip/tepe anini yakalar.
+      3) Yaklasma      : pos henuz esige degmemis ama yaklasma bolgesindeyken
+         (esik, esik+MARGIN] BB sikismasi + hacim artisi varsa erken
+         tetiklenir (score_breakout'taki erken kirilim mantiginin kanal
+         versiyonu).
+      4) Diverjans     : RSI/fiyat diverjansi tek basina (banda cok
+         yakin degilse bile, esik+2*MARGIN icindeyse) tetikleyici sayilir.
 
-    STRONG breakout sinyaliyle ayni anda tetiklenebilir (farkli strategy alani
-    ile ayirt edilir); biri digerini bastirmaz.
+    Kanal ortasinda (hicbiri gecerli degilse) None doner -- sinyal yok.
+    Puan butcesi STRONG (varsayilan 70) esigine SADECE confluence ile
+    ulasilacak sekilde kalibre edildi; tek-sinyalli zayif "yaklasiyor"
+    durumlari dogal olarak WATCH'in altinda kalir.
     """
     if not cfg.CHANNEL_TRADE_ENABLED:
         return None
 
     pos = s.channel_pos
-    if pos <= cfg.CHANNEL_TRADE_POS_LONG:
+    margin = cfg.CHANNEL_TRADE_APPROACH_MARGIN
+    squeeze = s.bb_width_avg > 0 and s.bb_width <= 0.8 * s.bb_width_avg
+    vol_picking_up = s.volume_ratio >= 1.2 or s.quote_volume_rising
+
+    exact_long = pos <= cfg.CHANNEL_TRADE_POS_LONG
+    exact_short = pos >= cfg.CHANNEL_TRADE_POS_SHORT
+
+    recent_long = (not exact_long and s.channel_pos_min_recent <= cfg.CHANNEL_TRADE_POS_LONG
+                   and pos <= cfg.CHANNEL_TRADE_POS_LONG + margin and s.last_bullish)
+    recent_short = (not exact_short and s.channel_pos_max_recent >= cfg.CHANNEL_TRADE_POS_SHORT
+                    and pos >= cfg.CHANNEL_TRADE_POS_SHORT - margin and not s.last_bullish)
+
+    approach_long = (not exact_long and not recent_long
+                      and cfg.CHANNEL_TRADE_POS_LONG < pos <= cfg.CHANNEL_TRADE_POS_LONG + margin
+                      and squeeze and vol_picking_up and (s.last_bullish or s.channel_slope_up))
+    approach_short = (not exact_short and not recent_short
+                       and cfg.CHANNEL_TRADE_POS_SHORT - margin <= pos < cfg.CHANNEL_TRADE_POS_SHORT
+                       and squeeze and vol_picking_up and ((not s.last_bullish) or not s.channel_slope_up))
+
+    div_long = (s.bullish_divergence and pos <= cfg.CHANNEL_TRADE_POS_LONG + 2 * margin
+                and not (exact_long or recent_long or approach_long))
+    div_short = (s.bearish_divergence and pos >= cfg.CHANNEL_TRADE_POS_SHORT - 2 * margin
+                 and not (exact_short or recent_short or approach_short))
+
+    long_candidate = exact_long or recent_long or approach_long or div_long
+    short_candidate = exact_short or recent_short or approach_short or div_short
+
+    if long_candidate and short_candidate:
+        # cok nadir kenar durum (oynak kanalda iki ucu da yoklanmis): banda
+        # daha derin/yakin olani sec
+        long_candidate, short_candidate = (True, False) if pos <= (1.0 - pos) else (False, True)
+
+    if long_candidate:
         direction = "LONG"
-    elif pos >= cfg.CHANNEL_TRADE_POS_SHORT:
+    elif short_candidate:
         direction = "SHORT"
     else:
-        return None  # kanal ortasi: kanal/swing modu icin net firsat yok
+        return None  # kanal ortasi / hicbir tetikleyici yok
 
     setup_s, setup_r = score_channel_trade_setup(s, direction)
     liq_s, liq_r = score_liquidity(cfg, s, direction)
     risk_p, risk_w = score_risk(cfg, s)
 
-    # banda YAKINLIK bonusu: esigin de icinde ne kadar derinse o kadar iyi
+    trigger_pts = 0.0
+    trigger_reason = ""
     if direction == "LONG":
-        closeness = (cfg.CHANNEL_TRADE_POS_LONG - pos) / max(cfg.CHANNEL_TRADE_POS_LONG, 1e-6)
+        if exact_long:
+            closeness = min(max((cfg.CHANNEL_TRADE_POS_LONG - pos) / max(cfg.CHANNEL_TRADE_POS_LONG, 1e-6), 0.0), 1.0)
+            trigger_pts = 10.0 + closeness * 15.0
+            trigger_reason = f"Kanal alt bandina tam degme (poz={pos:.2f})"
+        elif recent_long:
+            trigger_pts = 18.0
+            trigger_reason = f"Son {cfg.CHANNEL_TRADE_RECENT_BARS} mumda alt bandi yokladi, toparlaniyor"
+        elif approach_long:
+            trigger_pts = 12.0
+            trigger_reason = "Erken yaklasma: sikisma + hacim artisi"
+        elif div_long:
+            trigger_pts = 10.0
+            trigger_reason = "Diverjans tetikli erken giris"
     else:
-        closeness = (pos - cfg.CHANNEL_TRADE_POS_SHORT) / max(1.0 - cfg.CHANNEL_TRADE_POS_SHORT, 1e-6)
-    closeness = min(max(closeness, 0.0), 1.0)
-    prox_pts = closeness * 15.0
+        if exact_short:
+            closeness = min(max((pos - cfg.CHANNEL_TRADE_POS_SHORT) / max(1.0 - cfg.CHANNEL_TRADE_POS_SHORT, 1e-6), 0.0), 1.0)
+            trigger_pts = 10.0 + closeness * 15.0
+            trigger_reason = f"Kanal ust bandina tam degme (poz={pos:.2f})"
+        elif recent_short:
+            trigger_pts = 18.0
+            trigger_reason = f"Son {cfg.CHANNEL_TRADE_RECENT_BARS} mumda ust bandi yokladi, geriliyor"
+        elif approach_short:
+            trigger_pts = 12.0
+            trigger_reason = "Erken yaklasma: sikisma + hacim artisi"
+        elif div_short:
+            trigger_pts = 10.0
+            trigger_reason = "Diverjans tetikli erken giris"
+
+    # hacim teyidi: donus noktasinda belirgin hacim -- katilim var demek
+    vol_pts = 0.0
+    if s.volume_ratio >= 2.0:
+        vol_pts = 10.0
+        liq_r = liq_r + ["Hacim guclu teyit"]
+    elif s.volume_ratio >= 1.3:
+        vol_pts = 5.0
 
     if pos < 0.0 or pos > 1.0:
         # bandin tamamen disina tasmis -- guclu kirilim ya da kanal artik
@@ -1120,10 +1298,11 @@ def evaluate_channel_trade(cfg: Config, s: MarketSnapshot, timeframe: str) -> Op
         risk_w.append(f"Fiyat kanalin tamamen disinda (poz={pos:.2f})")
 
     total_risk = min(risk_p, 40.0)
-    raw = setup_s + prox_pts + liq_s - total_risk
+    raw = setup_s + trigger_pts + vol_pts + liq_s - total_risk
     score = float(max(0.0, min(100.0, raw)))
 
-    reasons = setup_r + [f"Kanal poz={pos:.2f} ({'alt' if direction == 'LONG' else 'ust'} bant yakini)"] + liq_r
+    # mesaj kisa/oz olsun diye en fazla 2 gerekce: tetikleyici + en guclu teyit
+    reasons = [trigger_reason] + setup_r[:1]
     warnings = risk_w
 
     if direction == "LONG":
@@ -1133,9 +1312,9 @@ def evaluate_channel_trade(cfg: Config, s: MarketSnapshot, timeframe: str) -> Op
 
     return Signal(
         symbol=s.symbol, timeframe=timeframe, direction=direction, score=score,
-        volatility=0.0, volume=0.0, momentum=setup_s, liquidity=liq_s, breakout=0.0,
+        volatility=0.0, volume=vol_pts, momentum=setup_s, liquidity=liq_s, breakout=trigger_pts,
         risk_penalty=total_risk, reasons=reasons, warnings=warnings, price=s.price,
-        invalidation=invalidation, early_trigger=False, snap=s,
+        invalidation=invalidation, early_trigger=(not exact_long and not exact_short), snap=s,
         strategy="KANAL",
     )
 
@@ -1273,11 +1452,18 @@ def build_message(cfg: Config, sig: Signal, include_link: bool = True) -> str:
     """
     s = sig.snap
     if sig.strategy == "KANAL":
-        tag = "🎯" if sig.tier == "STRONG" else "🔍"
-        tier_lbl = "KANAL GIRISI (GUCLU)" if sig.tier == "STRONG" else "Kanal Izleme"
-    else:
-        tag = "🚨" if sig.tier == "STRONG" else "👀"
-        tier_lbl = "GUCLU FIRSAT" if sig.tier == "STRONG" else "Izleme"
+        # Cok kisa/oz format: yon, skor, tek gerekce, fiyat, gecersizlik seviyesi.
+        tag = "🎯"
+        reason = sig.reasons[0] if sig.reasons else "Kanal bandi"
+        text = (
+            f"{tag} KANAL {sig.direction} | {sig.symbol} ({sig.timeframe}) — "
+            f"Skor {sig.score:.0f}. {reason}. "
+            f"Fiyat {fmt_price(s.price)} | Gecersizlik: {sig.invalidation}"
+        )
+        return text
+
+    tag = "🚨" if sig.tier == "STRONG" else "👀"
+    tier_lbl = "GUCLU FIRSAT" if sig.tier == "STRONG" else "Izleme"
     top_reasons = ", ".join(sig.reasons[:3]) if sig.reasons else "-"
 
     text = (
@@ -1526,6 +1712,21 @@ async def process_symbol(cfg: Config, client: ExchangeClient, symbol: str,
         return signals
 
 
+def _should_send_to_telegram(cfg: Config, sig: Signal) -> bool:
+    """Telegram gonderim filtresi. Varsayilan: SADECE strategy=KANAL ve
+    tier=STRONG. BREAKOUT ve KANAL/WATCH bayraklarla acilabilir (bkz. Config)."""
+    if sig.strategy == "KANAL":
+        if sig.tier == "STRONG":
+            return True
+        if sig.tier == "WATCH" and cfg.TELEGRAM_SEND_KANAL_WATCH:
+            return True
+        return False
+    # BREAKOUT
+    if not cfg.TELEGRAM_SEND_BREAKOUT:
+        return False
+    return sig.tier in ("STRONG", "WATCH")
+
+
 # ==============================================================================
 # 14) TARAMA TURU  (async)
 # ==============================================================================
@@ -1558,12 +1759,13 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
         print_summary(sig)
 
     # alarm gonder (Telegram HTTP'yi ayri thread'de calistir; dongu bloklanmasin)
-    # Once 144-periyot regresyon kanali gorseli denenir (TradingView linki
-    # yerine); gorsel olusmazsa (matplotlib yok / veri yetersiz / hata) eski
-    # metin+link formatina otomatik geri donulur.
+    # Varsayilan: SADECE kanal-banda-dayali kesin LONG/SHORT (KANAL + STRONG)
+    # Telegram'a gider (bkz. _should_send_to_telegram). BREAKOUT ve KANAL/WATCH
+    # yine de hesaplanir + terminal ozetinde gorulur, sadece Telegram'a gitmez
+    # (cfg.TELEGRAM_SEND_BREAKOUT / TELEGRAM_SEND_KANAL_WATCH ile acilabilir).
     alerts = 0
     for sig in sorted(signals, key=lambda x: x.score, reverse=True):
-        if sig.tier in ("STRONG", "WATCH") and cooldown.should_alert(sig):
+        if _should_send_to_telegram(cfg, sig) and cooldown.should_alert(sig):
             chart = None
             try:
                 chart = await asyncio.to_thread(build_regression_chart, cfg, sig)
@@ -1574,13 +1776,19 @@ async def scan_once(cfg: Config, client: ExchangeClient, cooldown: CooldownManag
             if chart:
                 caption = build_message(cfg, sig, include_link=False)
                 ok = await asyncio.to_thread(send_telegram_photo, cfg, chart, caption)
-                if not ok:  # gorsel gonderimi basarisizsa metin olarak yedekle
+                if not ok and sig.strategy != "KANAL":  # KANAL icin metin yedegi YOK (gorsel zorunlu)
                     ok = await asyncio.to_thread(send_telegram, cfg, build_message(cfg, sig))
+            elif sig.strategy == "KANAL":
+                # KANAL sinyalinde grafik zorunlu -- olusmadiysa mesaj hic gonderilmez.
+                log.warning("KANAL sinyali gorselsiz gonderilmedi (zorunlu): %s [%s]",
+                            sig.symbol, sig.timeframe)
+                ok = False
             else:
                 ok = await asyncio.to_thread(send_telegram, cfg, build_message(cfg, sig))
 
             if ok:
-                log.info("📨 Telegram gonderildi: %s [%s] (%s)", sig.symbol, sig.timeframe, sig.tier)
+                log.info("📨 Telegram gonderildi: %s [%s] (%s/%s)",
+                         sig.symbol, sig.timeframe, sig.strategy, sig.tier)
                 cooldown.record(sig)
                 alerts += 1
 
